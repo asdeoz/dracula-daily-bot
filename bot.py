@@ -3,6 +3,7 @@ import re
 import datetime
 import logging
 from pathlib import Path
+from typing import Optional
 
 import discord
 import feedparser
@@ -35,7 +36,7 @@ def load_state() -> dict:
     if STATE_FILE.exists():
         with STATE_FILE.open() as f:
             return json.load(f)
-    return {"last_seen_guid": None, "channel_id": None, "check_hour": config.CHECK_HOUR_UTC}
+    return {"channels": {}}
 
 
 def save_state(state: dict) -> None:
@@ -47,7 +48,7 @@ def save_state(state: dict) -> None:
 # Feed helpers
 # ---------------------------------------------------------------------------
 
-def fetch_latest_entry() -> feedparser.FeedParserDict | None:
+def fetch_latest_entry() -> Optional[feedparser.FeedParserDict]:
     feed = feedparser.parse(config.FEED_URL)
     if feed.bozo:
         log.warning("Feed parse warning: %s", feed.bozo_exception)
@@ -85,14 +86,7 @@ def build_embed(entry: feedparser.FeedParserDict) -> discord.Embed:
     return embed
 
 
-def restart_loop(hour: int) -> None:
-    """Restart the check_feed loop with a new check time."""
-    if check_feed.is_running():
-        check_feed.cancel()
-    new_time = datetime.time(hour=hour, minute=0, tzinfo=datetime.timezone.utc)
-    check_feed._time = [new_time]  # mutate the internal time list used by the loop
-    check_feed.start()
-    log.info("Feed check rescheduled to %02d:00 UTC.", hour)
+
 
 
 # ---------------------------------------------------------------------------
@@ -107,15 +101,16 @@ tree = app_commands.CommandTree(client)
 @tree.command(name="dracula-help", description="Show information and setup instructions for Dracula Daily.")
 async def dracula_help(interaction: discord.Interaction) -> None:
     state = load_state()
-    channel_id = state.get("channel_id")
-    check_hour = state.get("check_hour", config.CHECK_HOUR_UTC)
+    guild_id = str(interaction.guild_id)
+    channel_config = state.get("channels", {}).get(guild_id)
+    channel_id = channel_config["channel_id"] if channel_config else None
     channel_status = f"<#{channel_id}>" if channel_id else "not set — use `/dracula-setchannel` to configure it"
 
     embed = discord.Embed(
         title="Dracula Daily Bot",
         description=(
             "This bot checks [Dracula Daily](https://draculadaily.substack.com/) "
-            "once a day and posts new entries to a channel of your choice."
+            "every 3 hours and posts new entries to a channel of your choice."
         ),
         color=DRACULA_RED,
     )
@@ -125,12 +120,11 @@ async def dracula_help(interaction: discord.Interaction) -> None:
         name="Commands",
         value=(
             "`/dracula-setchannel` — Set the current channel as the posting channel *(requires Manage Channels)*\n"
-            "`/dracula-time <0-23>` — Set the hour (UTC) the bot checks for new posts *(requires Manage Channels)*\n"
+            "`/dracula-check` — Manually trigger a feed check *(requires Manage Channels)*\n"
             "`/dracula-help` — Show this message"
         ),
         inline=False,
     )
-    embed.add_field(name="Check time", value=f"Daily at {check_hour:02d}:00 UTC", inline=False)
     embed.set_footer(text="Only visible to you")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -140,9 +134,15 @@ async def dracula_help(interaction: discord.Interaction) -> None:
 @app_commands.checks.has_permissions(manage_channels=True)
 async def setchannel(interaction: discord.Interaction) -> None:
     state = load_state()
-    state["channel_id"] = interaction.channel_id
+    if "channels" not in state:
+        state["channels"] = {}
+    guild_id = str(interaction.guild_id)
+    state["channels"][guild_id] = {
+        "channel_id": interaction.channel_id,
+        "last_seen_guid": None
+    }
     save_state(state)
-    log.info("Channel set to %s by %s.", interaction.channel_id, interaction.user)
+    log.info("Channel set to %s for guild %s by %s.", interaction.channel_id, guild_id, interaction.user)
     await interaction.response.send_message(
         f"Done! Dracula Daily posts will be sent to <#{interaction.channel_id}>.",
         ephemeral=True,
@@ -158,52 +158,35 @@ async def setchannel_error(interaction: discord.Interaction, error: app_commands
         )
 
 
-@tree.command(name="dracula-time", description="Set the hour (UTC) the bot checks for new posts. Accepts 0-23.")
-@app_commands.describe(hour="Hour in UTC (0-23), e.g. 8 for 08:00 UTC")
+@tree.command(name="dracula-check", description="Manually trigger a feed check for new Dracula Daily posts.")
 @app_commands.checks.has_permissions(manage_channels=True)
-async def set_check_time(interaction: discord.Interaction, hour: int) -> None:
-    if hour < 0 or hour > 23:
-        await interaction.response.send_message(
-            "Invalid time. Please provide an integer between **0** and **23** (e.g. `/dracula-time 8` for 08:00 UTC).",
-            ephemeral=True,
-        )
-        return
-
-    state = load_state()
-    state["check_hour"] = hour
-    save_state(state)
-    restart_loop(hour)
-
-    await interaction.response.send_message(
-        f"Done! The bot will now check for new posts daily at **{hour:02d}:00 UTC**.",
-        ephemeral=True,
-    )
+async def manual_check(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    await check_feed()
+    await interaction.followup.send("Feed check completed!", ephemeral=True)
 
 
-@set_check_time.error
-async def set_check_time_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+@manual_check.error
+async def manual_check_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
             "You need the **Manage Channels** permission to use this command.",
             ephemeral=True,
         )
-    elif isinstance(error, app_commands.TransformerError):
-        await interaction.response.send_message(
-            "Invalid value. Please provide an integer between **0** and **23** (e.g. `/dracula-time 8`).",
-            ephemeral=True,
-        )
 
 
-@tasks.loop(
-    time=datetime.time(hour=config.CHECK_HOUR_UTC, minute=0, tzinfo=datetime.timezone.utc)
-)
+
+
+
+@tasks.loop(hours=3)
 async def check_feed() -> None:
-    log.info("Checking Dracula Daily feed...")
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    log.info("Checking Dracula Daily feed... [%s]", now)
     state = load_state()
 
-    channel_id = state.get("channel_id")
-    if not channel_id:
-        log.warning("No channel set. Use /dracula-setchannel in your server first.")
+    channels_config = state.get("channels", {})
+    if not channels_config:
+        log.warning("No channels configured. Use /dracula-setchannel in your servers.")
         return
 
     entry = fetch_latest_entry()
@@ -211,26 +194,32 @@ async def check_feed() -> None:
         return
 
     guid = entry.get("id") or entry.get("link")
-    if guid == state.get("last_seen_guid"):
-        log.info("No new post found. Last seen: %s", guid)
-        return
-
-    log.info("New post found: %s", guid)
-
-    try:
-        channel = await client.fetch_channel(channel_id)
-    except discord.NotFound:
-        log.error("Channel %s not found. Run /dracula-setchannel again.", channel_id)
-        return
-    except discord.Forbidden:
-        log.error("Bot lacks permission to access channel %s.", channel_id)
-        return
-
     embed = build_embed(entry)
-    await channel.send(embed=embed)
-    log.info("Embed sent to channel %s.", channel_id)
+    
+    # Send to all configured channels
+    for guild_id, config in channels_config.items():
+        channel_id = config["channel_id"]
+        last_guid = config.get("last_seen_guid")
+        
+        # Check if this guild has already seen this post
+        if guid == last_guid:
+            log.info("Post already sent to guild %s. Skipping.", guild_id)
+            continue
+        
+        try:
+            channel = await client.fetch_channel(channel_id)
+            await channel.send(embed=embed)
+            log.info("Embed sent to channel %s (guild %s).", channel_id, guild_id)
+            
+            # Update last seen guid for this specific guild
+            state["channels"][guild_id]["last_seen_guid"] = guid
+        except discord.NotFound:
+            log.error("Channel %s not found in guild %s.", channel_id, guild_id)
+        except discord.Forbidden:
+            log.error("Bot lacks permission to access channel %s in guild %s.", channel_id, guild_id)
+        except Exception as e:
+            log.error("Error sending to channel %s in guild %s: %s", channel_id, guild_id, e)
 
-    state["last_seen_guid"] = guid
     save_state(state)
 
 
@@ -245,15 +234,10 @@ async def on_ready() -> None:
     synced = await tree.sync()
     log.info("Slash commands synced: %s", [cmd.name for cmd in synced])
 
-    # Restore saved check time if it differs from the default
-    state = load_state()
-    saved_hour = state.get("check_hour", config.CHECK_HOUR_UTC)
-    if saved_hour != config.CHECK_HOUR_UTC:
-        restart_loop(saved_hour)
-    elif not check_feed.is_running():
+    if not check_feed.is_running():
         check_feed.start()
 
-    log.info("Daily check scheduled at %02d:00 UTC.", saved_hour)
+    log.info("Feed check scheduled every 3 hours.")
     await check_feed()  # Run immediately on startup
 
 
